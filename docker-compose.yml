@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: flowforge
       POSTGRES_PASSWORD: flowforge_dev
     ports:
-      - "5432:5432"
+      - "15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -14,6 +14,23 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: flowforge
+      RABBITMQ_DEFAULT_PASS: flowforge_dev
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   api:
     build:
@@ -29,5 +46,26 @@ services:
       db:
         condition: service_healthy
 
+  publisher:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.messaging.publisher"]
+    environment:
+      APP_NAME: FlowForge
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://flowforge:flowforge_dev@db:5432/flowforge
+      RABBITMQ_URL: amqp://flowforge:flowforge_dev@rabbitmq:5672/%2F
+      OUTBOX_BATCH_SIZE: 10
+      OUTBOX_POLL_INTERVAL_SECONDS: 2
+      OUTBOX_LEASE_SECONDS: 60
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+  rabbitmq_data:
