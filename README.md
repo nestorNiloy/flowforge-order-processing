@@ -1,6 +1,6 @@
 # FlowForge — Event-Driven Order Processing Platform
 
-FlowForge is a backend engineering project demonstrating reliable order processing and inventory consistency. The system starts with a transactional order API; later milestones introduce asynchronous messaging, independent workers, retries, idempotency and failure recovery.
+FlowForge is a backend engineering project demonstrating reliable order processing, inventory consistency, and asynchronous event-driven workflows. It is built as a learning and portfolio system; it does not process real payments or ship real orders.
 
 ## Project status
 
@@ -8,9 +8,13 @@ FlowForge is a backend engineering project demonstrating reliable order processi
 
 FastAPI, PostgreSQL, SQLAlchemy, Alembic, Docker Compose and backend CI are in place.
 
-**Phase 2 — Order domain: in progress**
+**Phase 2 — Order domain: complete**
 
-The API supports order creation and retrieval. Order creation reserves inventory in the same database transaction, using a conditional SQL update to prevent overselling. Order items preserve product-name and unit-price snapshots.
+The API supports order creation and retrieval. Order creation reserves inventory in the same database transaction, using a conditional SQL update to prevent overselling. Order items preserve product-name and unit-price snapshots. The PostgreSQL test suite verifies rollback and concurrent inventory reservation.
+
+**Phase 3 — Event-driven processing: in progress**
+
+The architecture is documented in [docs/phase-3-architecture.md](docs/phase-3-architecture.md). The implementation will introduce a transactional outbox, RabbitMQ publisher, idempotent worker, bounded retries and dead-letter handling.
 
 ## Current architecture
 
@@ -18,10 +22,10 @@ The API supports order creation and retrieval. Order creation reserves inventory
 - **PostgreSQL** stores products, orders, order items and inventory.
 - **SQLAlchemy** manages persistence and atomic transactions.
 - **Alembic** versions database schema changes.
-- **Docker Compose** runs the API and database locally.
+- **Docker Compose** runs local infrastructure.
 - **GitHub Actions** runs automated tests against PostgreSQL.
 
-RabbitMQ workers, retry policies, dead-letter handling, idempotency and an operational dashboard are planned for later milestones.
+The target Phase 3 architecture adds an outbox publisher and an independent message consumer. See the [Phase 3 architecture and reliability plan](docs/phase-3-architecture.md).
 
 ## Run locally
 
@@ -30,7 +34,7 @@ Prerequisites: Docker Desktop with Docker Compose, Git and Python 3.12+.
 ```bash
 git clone https://github.com/nestorNiloy/flowforge-order-processing.git
 cd flowforge-order-processing
-git switch feature/phase-2-order-domain
+git switch main
 docker compose up --build -d
 ```
 
@@ -103,7 +107,9 @@ GitHub Actions runs the complete test suite against a temporary PostgreSQL 16 se
 - Use conditional database updates rather than unsafe read-then-write stock checks.
 - Preserve historical product details on order items.
 - Keep schema changes versioned and reviewable.
-- Test success paths, validation failures, rollback behavior and concurrent requests.
+- Publish integration events through a transactional outbox rather than dual-writing to the database and broker.
+- Design consumers for at-least-once delivery and idempotent processing.
+- Test success paths, validation failures, rollback behavior, concurrency and failure recovery.
 
 ## Scope
 
