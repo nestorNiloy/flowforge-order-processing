@@ -14,12 +14,12 @@ The API supports order creation and retrieval. Order creation reserves inventory
 
 **Phase 3 — Event-driven processing: in progress**
 
-The architecture is documented in [docs/phase-3-architecture.md](docs/phase-3-architecture.md). The implementation will introduce a transactional outbox, RabbitMQ publisher, idempotent worker, bounded retries and dead-letter handling.
+The architecture is documented in [docs/phase-3-architecture.md](docs/phase-3-architecture.md). The first implementation increment adds a PostgreSQL outbox table and records a versioned `OrderCreated` event in the same transaction as order creation and inventory reservation. RabbitMQ publishing and the independent worker are subsequent increments.
 
 ## Current architecture
 
 - **FastAPI** validates requests and exposes the order API.
-- **PostgreSQL** stores products, orders, order items and inventory.
+- **PostgreSQL** stores products, orders, order items, inventory and durable outbox events.
 - **SQLAlchemy** manages persistence and atomic transactions.
 - **Alembic** versions database schema changes.
 - **Docker Compose** runs local infrastructure.
