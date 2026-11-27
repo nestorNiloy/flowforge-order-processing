@@ -23,7 +23,6 @@ def upgrade() -> None:
         sa.Column("available_quantity", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("sku", name="uq_products_sku"),
     )
     op.create_index("ix_products_sku", "products", ["sku"], unique=True)
 
