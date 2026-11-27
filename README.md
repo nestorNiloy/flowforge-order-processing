@@ -16,19 +16,23 @@ The API supports order creation and retrieval. Order creation reserves inventory
 
 - **3.0 — Architecture and branch setup:** complete.
 - **3.1 — Transactional outbox:** complete. Each successful order and its versioned `OrderCreated` event commit atomically.
-- **3.2 — RabbitMQ and publisher:** implementation in progress. A separate publisher leases pending outbox rows, sends persistent messages to a durable RabbitMQ exchange/queue, and marks rows published only after broker confirmation.
+- **3.2 — RabbitMQ and publisher:** implementation and local end-to-end publishing verification complete. The publisher leases pending outbox rows, sends persistent messages to a durable RabbitMQ exchange/queue, and marks rows published only after broker confirmation.
+- **3.3 — Idempotent worker:** implementation added on the current feature branch; database and RabbitMQ verification pending. The worker records an inbox event and a downstream processing result in one transaction, then acknowledges the delivery.
+- **3.4 — Retry and dead-letter handling:** planned.
+- **3.5 — End-to-end verification:** planned.
 
-The remaining increments add an idempotent worker, bounded retry/dead-letter handling, and end-to-end verification. See [docs/phase-3-architecture.md](docs/phase-3-architecture.md).
+See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for design and failure semantics.
 
 ## Current architecture
 
 - **FastAPI** validates requests and exposes the order API.
-- **PostgreSQL** stores products, orders, order items, inventory and durable outbox events.
+- **PostgreSQL** stores products, orders, order items, inventory, outbox events, processed-message inbox records and downstream processing results.
 - **Outbox publisher** independently claims and publishes pending integration events.
 - **RabbitMQ** provides a durable exchange and order queue.
+- **Order worker** consumes messages with manual acknowledgements and event-ID deduplication.
 - **SQLAlchemy** manages persistence and atomic transactions.
 - **Alembic** versions database schema changes.
-- **Docker Compose** runs the API, database, broker and publisher locally.
+- **Docker Compose** runs the API, database, broker, publisher and worker locally.
 - **GitHub Actions** runs automated tests against PostgreSQL and RabbitMQ services.
 
 The API does not depend on RabbitMQ availability. If the broker is down, order creation can continue and events remain pending in PostgreSQL.
@@ -40,7 +44,7 @@ Prerequisites: Docker Desktop with Docker Compose, Git and Python 3.12+.
 ~~~powershell
 git clone https://github.com/nestorNiloy/flowforge-order-processing.git
 cd flowforge-order-processing
-git switch feature/phase-3-event-driven-foundation
+git switch feature/phase-3-idempotent-worker
 docker compose up --build -d
 ~~~
 
@@ -57,7 +61,7 @@ $env:DATABASE_URL = "postgresql+psycopg://flowforge:flowforge_dev@localhost:1543
 alembic upgrade head
 ~~~
 
-The latest migration adds publisher lease fields to the outbox table. The API and publisher containers connect to PostgreSQL internally through `db:5432`; the host uses port `15432`.
+Migration `0005_create_worker_tables` adds the `processed_messages` inbox and `order_processing_results` downstream result table. The API, publisher and worker containers connect to PostgreSQL internally through `db:5432`; the host uses port `15432`.
 
 ## API
 
@@ -97,7 +101,7 @@ $env:RABBITMQ_URL = "amqp://flowforge:flowforge_dev@localhost:5672/%2F"
 python -m pytest backend/tests -v
 ~~~
 
-The publisher lease tests require PostgreSQL because they verify row-locking and `SKIP LOCKED` behavior. The RabbitMQ integration test runs when `RABBITMQ_URL` is set. GitHub Actions starts temporary PostgreSQL and RabbitMQ services for the full suite.
+The database tests require PostgreSQL because they verify transaction and row-locking behavior. RabbitMQ integration tests run when `RABBITMQ_URL` is set. GitHub Actions starts temporary PostgreSQL and RabbitMQ services for the full suite.
 
 The test suite creates and drops its tables in `flowforge_test`; never point `TEST_DATABASE_URL` at a database containing data you need to keep.
 
@@ -109,7 +113,16 @@ The test suite creates and drops its tables in `flowforge_test`; never point `TE
 - Publisher confirms and mandatory routing are enabled.
 - An event is marked `PUBLISHED` only after a positive broker confirmation.
 - Failed sends return to the pending state with a short retry delay. The bounded retry/dead-letter policy is implemented in Phase 3.4.
-- A crash after broker confirmation but before the database update can cause redelivery. This is intentional at-least-once delivery; the worker added in Phase 3.3 will deduplicate by event ID.
+- A crash after broker confirmation but before the database update can cause redelivery. This is intentional at-least-once delivery.
+
+## Worker behavior
+
+- The worker consumes `OrderCreated` messages from the durable `flowforge.orders` queue with manual acknowledgements and a prefetch limit of one.
+- It validates the event ID, event type, schema version and aggregate metadata before processing.
+- A PostgreSQL inbox row with a unique event ID and a downstream `READY_FOR_FULFILLMENT` result are written in the same transaction.
+- PostgreSQL `ON CONFLICT DO NOTHING` makes duplicate event delivery safe, including concurrent deliveries.
+- The worker acknowledges only after the database transaction commits. Duplicate events are also acknowledged after confirming the prior processing record exists.
+- Processing failures are negatively acknowledged with requeue enabled in this increment. Phase 3.4 will replace the unbounded requeue behavior with bounded retries and a dead-letter route.
 
 ## Engineering principles
 
