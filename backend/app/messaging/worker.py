@@ -6,7 +6,6 @@ import time
 from decimal import Decimal, InvalidOperation
 
 import pika
-from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
