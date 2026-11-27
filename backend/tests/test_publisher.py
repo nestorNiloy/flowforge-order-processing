@@ -193,18 +193,19 @@ def test_rabbitmq_accepts_and_delivers_persistent_order_event():
 
         # Keep this integration test isolated from the live worker consumer.
         test_queue = f"{ORDERS_QUEUE_NAME}.test.{uuid4()}"
+        test_routing_key = f"{ORDER_CREATED_ROUTING_KEY}.test.{uuid4()}"
         channel.queue_declare(queue=test_queue, durable=False, exclusive=True, auto_delete=True)
         channel.queue_bind(
             exchange=EXCHANGE_NAME,
             queue=test_queue,
-            routing_key=ORDER_CREATED_ROUTING_KEY,
+            routing_key=test_routing_key,
         )
 
         event_id = str(uuid4())
         body = b'{"event_type":"OrderCreated","schema_version":1}'
         confirmed = channel.basic_publish(
             exchange=EXCHANGE_NAME,
-            routing_key=ORDER_CREATED_ROUTING_KEY,
+            routing_key=test_routing_key,
             body=body,
             properties=pika.BasicProperties(
                 content_type="application/json",
