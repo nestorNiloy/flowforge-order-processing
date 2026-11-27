@@ -1,0 +1,17 @@
+# Database migrations
+
+Alembic manages versioned PostgreSQL schema changes.
+
+From the `backend/` directory, create a revision with:
+
+```bash
+alembic revision --autogenerate -m "describe schema change"
+```
+
+Apply migrations with:
+
+```bash
+alembic upgrade head
+```
+
+Review generated migration files before applying them. Autogeneration is a starting point, not a substitute for reviewing the schema diff.
