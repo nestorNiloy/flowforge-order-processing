@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class OrderItemCreate(BaseModel):
@@ -12,6 +12,14 @@ class OrderItemCreate(BaseModel):
 class OrderCreate(BaseModel):
     customer_reference: str = Field(min_length=1, max_length=100)
     items: list[OrderItemCreate] = Field(min_length=1, max_length=100)
+
+    @field_validator("customer_reference")
+    @classmethod
+    def customer_reference_must_not_be_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Customer reference must not be blank.")
+        return value
 
     @model_validator(mode="after")
     def product_ids_must_be_unique(self):
