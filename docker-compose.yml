@@ -66,6 +66,24 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.messaging.worker"]
+    environment:
+      APP_NAME: FlowForge
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+psycopg://flowforge:flowforge_dev@db:5432/flowforge
+      RABBITMQ_URL: amqp://flowforge:flowforge_dev@rabbitmq:5672/%2F
+      WORKER_RECONNECT_SECONDS: 5
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   rabbitmq_data:
