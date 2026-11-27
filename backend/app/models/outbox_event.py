@@ -26,6 +26,7 @@ class OutboxEvent(Base):
         ),
         CheckConstraint("attempts >= 0", name="ck_outbox_events_attempts_non_negative"),
         Index("ix_outbox_events_status_created_at", "status", "created_at"),
+        Index("ix_outbox_events_status_available_at", "status", "available_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -48,3 +49,5 @@ class OutboxEvent(Base):
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(String(1000))
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    locked_by: Mapped[str | None] = mapped_column(String(100))
