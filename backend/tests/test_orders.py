@@ -8,7 +8,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.session import Base, get_db
 from app.main import app
-from app.models import Order, OrderItem, Product
+from app.models import Order, OrderItem, OutboxEvent, Product
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -87,6 +87,19 @@ def test_create_order_reserves_stock_and_returns_price_snapshot(client, db_sessi
     db_session.refresh(product)
     assert product.available_quantity == 8
 
+    events = db_session.query(OutboxEvent).all()
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "OrderCreated"
+    assert event.schema_version == 1
+    assert event.aggregate_type == "order"
+    assert event.aggregate_id == str(body["id"])
+    assert event.status == "PENDING"
+    assert event.payload["event_id"] == event.event_id
+    assert event.payload["order"]["id"] == body["id"]
+    assert event.payload["order"]["total_amount"] == "159.80"
+    assert event.payload["order"]["items"][0]["product_name"] == "Mechanical Keyboard"
+
 
 def test_order_item_keeps_snapshot_when_product_changes(client, db_session):
     product = add_product(db_session)
@@ -141,6 +154,7 @@ def test_failed_multi_item_order_rolls_back_earlier_reservation(client, db_sessi
     assert second.available_quantity == 1
     assert db_session.query(Order).count() == 0
     assert db_session.query(OrderItem).count() == 0
+    assert db_session.query(OutboxEvent).count() == 0
 
 
 def test_duplicate_product_lines_are_rejected(client):
@@ -185,3 +199,26 @@ def test_concurrent_orders_cannot_oversell_inventory(client, db_session):
     db_session.refresh(product)
     assert product.available_quantity == 1
     assert db_session.query(Order).count() == 1
+
+
+def test_successful_order_creates_exactly_one_pending_outbox_event(client, db_session):
+    product = add_product(db_session)
+
+    response = client.post("/api/v1/orders", json=order_payload(product.id, quantity=3))
+
+    assert response.status_code == 201
+    event = db_session.query(OutboxEvent).one()
+    assert event.status == "PENDING"
+    assert event.attempts == 0
+    assert event.event_id
+    assert event.payload["order"]["items"][0]["quantity"] == 3
+
+
+def test_failed_order_does_not_create_outbox_event(client, db_session):
+    product = add_product(db_session, quantity=1)
+
+    response = client.post("/api/v1/orders", json=order_payload(product.id, quantity=2))
+
+    assert response.status_code == 409
+    assert db_session.query(Order).count() == 0
+    assert db_session.query(OutboxEvent).count() == 0
