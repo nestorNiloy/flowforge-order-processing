@@ -34,10 +34,11 @@ Client ───────────────> FastAPI
                            v
                     independent worker
                            |
-                           | idempotent database transaction
+                           | one PostgreSQL transaction
                            v
                     PostgreSQL
-                    └── processed_messages / processing result
+                    ├── processed_messages (inbox)
+                    └── order_processing_results
 ~~~
 
 ## Event contract
@@ -50,11 +51,24 @@ The versioned envelope contains:
 - `event_type`: `OrderCreated`.
 - `schema_version`: initially `1`.
 - `occurred_at`: UTC timestamp.
-- `aggregate_type`: `order`.
-- `aggregate_id`: order ID.
+- `aggregate_type`: `order` (RabbitMQ message header).
+- `aggregate_id`: order ID (RabbitMQ message header).
 - `payload`: immutable order facts needed by the consumer (order ID, customer reference, total, and item snapshots).
 
 The event payload uses the item name and unit-price snapshots already stored on the order. It must not depend on mutable current product data.
+
+## Worker inbox and downstream effect
+
+The worker treats the RabbitMQ message ID as the idempotency key.
+
+1. It validates the JSON event envelope against the supported event type and schema version.
+2. It verifies the RabbitMQ `message_id` matches the payload `event_id`, and that aggregate headers match the order ID.
+3. In one PostgreSQL transaction, it inserts a `processed_messages` inbox row using `INSERT ... ON CONFLICT DO NOTHING`.
+4. Only when that insert succeeds does it create the matching `order_processing_results` row with status `READY_FOR_FULFILLMENT`.
+5. The inbox row and processing result commit or roll back together. The unique event ID prevents a duplicate delivery from repeating the downstream effect.
+6. It acknowledges the RabbitMQ delivery only after the transaction has committed. A duplicate delivery is acknowledged after the existing inbox record is detected.
+
+The processing result is an observable simulation of a downstream order workflow. It does not initiate real fulfilment or shipping.
 
 ## Delivery and failure semantics
 
@@ -68,7 +82,7 @@ The target guarantee is **at-least-once delivery with idempotent consumption**, 
 6. If the publisher crashes after RabbitMQ accepts a message but before the row is marked published, the lease eventually expires and the message may be sent again. This is expected.
 7. The consumer records the event ID and its business effect in one database transaction. A unique constraint on the event ID makes repeated deliveries harmless.
 8. The consumer acknowledges the RabbitMQ message only after the database transaction commits.
-9. Transient consumer failures are retried with a bounded policy. Messages that exhaust retries are routed to a dead-letter queue for inspection and controlled replay.
+9. In Phase 3.3, a failed delivery is negatively acknowledged with requeue enabled. Phase 3.4 will add bounded retries and dead-letter routing to prevent an invalid or persistently failing message from being requeued indefinitely.
 
 The outbox publisher and consumer are independently runnable processes. The API depends on PostgreSQL, not RabbitMQ; if the broker is temporarily unavailable, events accumulate in PostgreSQL until publishing resumes.
 
@@ -94,12 +108,15 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Mark rows published only after confirmation; implement PostgreSQL `SKIP LOCKED` claiming and expiring leases.
 - Keep broker I/O outside database transactions.
 - Test positive/negative confirmations, concurrent claims, lease recovery after publisher crash, and real RabbitMQ delivery.
+- **Status: implemented and locally verified end to end.**
 
 ### Phase 3.3 — Idempotent worker
-- Add a separate worker process and durable queue topology.
+- Add a separate worker process and durable queue consumer.
 - Add a processed-message/inbox record with a unique event ID.
-- Persist a small, observable downstream processing result in the same transaction as the inbox record.
-- Acknowledge only after commit; test duplicate delivery.
+- Persist a downstream processing result in the same transaction as the inbox record.
+- Validate event metadata and acknowledge only after commit.
+- Test duplicate delivery, rollback, invalid events and acknowledgement behavior.
+- **Status: implementation added; local migration, test and container verification pending.**
 
 ### Phase 3.4 — Retry and dead-letter handling
 - Add bounded retries and dead-letter routing.
@@ -121,6 +138,7 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Concurrent publishers use leases so they do not routinely claim the same event.
 - Expired leases allow recovery after a publisher crash.
 - Duplicate deliveries do not duplicate the worker's business effect.
+- Inbox record and downstream result commit or roll back atomically.
 - Messages are acknowledged only after successful consumer-side commit.
 - Retry attempts are bounded; exhausted messages are inspectable in a dead-letter queue.
 - CI tests database behavior and messaging integration without relying on external hosted services.
