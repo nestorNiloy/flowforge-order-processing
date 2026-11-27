@@ -23,10 +23,23 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: flowforge
+          RABBITMQ_DEFAULT_PASS: flowforge_dev
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       PYTHONPATH: backend
       DATABASE_URL: postgresql+psycopg://flowforge:flowforge_dev@localhost:5432/flowforge_test
       TEST_DATABASE_URL: postgresql+psycopg://flowforge:flowforge_dev@localhost:5432/flowforge_test
+      RABBITMQ_URL: amqp://flowforge:flowforge_dev@localhost:5672/%2F
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
