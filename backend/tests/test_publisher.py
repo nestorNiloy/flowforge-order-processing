@@ -191,6 +191,15 @@ def test_rabbitmq_accepts_and_delivers_persistent_order_event():
         declare_topology(channel)
         channel.confirm_delivery()
 
+        # Keep this integration test isolated from the live worker consumer.
+        test_queue = f"{ORDERS_QUEUE_NAME}.test.{uuid4()}"
+        channel.queue_declare(queue=test_queue, durable=False, exclusive=True, auto_delete=True)
+        channel.queue_bind(
+            exchange=EXCHANGE_NAME,
+            queue=test_queue,
+            routing_key=ORDER_CREATED_ROUTING_KEY,
+        )
+
         event_id = str(uuid4())
         body = b'{"event_type":"OrderCreated","schema_version":1}'
         confirmed = channel.basic_publish(
@@ -208,7 +217,7 @@ def test_rabbitmq_accepts_and_delivers_persistent_order_event():
         assert confirmed is not False
 
         method, properties, received_body = channel.basic_get(
-            queue=ORDERS_QUEUE_NAME,
+            queue=test_queue,
             auto_ack=False,
         )
         assert method is not None
@@ -216,3 +225,4 @@ def test_rabbitmq_accepts_and_delivers_persistent_order_event():
         assert properties.delivery_mode == 2
         assert received_body == body
         channel.basic_ack(delivery_tag=method.delivery_tag)
+        channel.queue_delete(queue=test_queue)
