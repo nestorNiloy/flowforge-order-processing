@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     outbox_poll_interval_seconds: float = 2.0
     outbox_lease_seconds: int = 60
     publisher_reconnect_seconds: float = 5.0
+    worker_reconnect_seconds: float = 5.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
