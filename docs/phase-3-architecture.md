@@ -12,7 +12,7 @@ The API must not publish directly to RabbitMQ as part of the HTTP request. A dat
 
 Instead, the API writes the order, reserves inventory, and inserts an outbox event in the **same PostgreSQL transaction**.
 
-```text
+~~~text
                   synchronous request
 Client ───────────────> FastAPI
                            |
@@ -24,7 +24,7 @@ Client ───────────────> FastAPI
                     ├── products (reserved stock)
                     └── outbox_events
                            |
-                           | separate publisher polls pending rows
+                           | leased rows, publisher confirms
                            v
                        RabbitMQ
                     durable exchange
@@ -38,13 +38,13 @@ Client ───────────────> FastAPI
                            v
                     PostgreSQL
                     └── processed_messages / processing result
-```
+~~~
 
 ## Event contract
 
 The first event is `OrderCreated`. It is an integration event, not a serialized SQLAlchemy model.
 
-The versioned envelope will contain:
+The versioned envelope contains:
 
 - `event_id`: globally unique UUID, used for deduplication.
 - `event_type`: `OrderCreated`.
@@ -61,15 +61,16 @@ The event payload uses the item name and unit-price snapshots already stored on 
 The target guarantee is **at-least-once delivery with idempotent consumption**, not an unrealistic claim of end-to-end exactly-once delivery.
 
 1. The outbox row is committed atomically with the order.
-2. A publisher claims pending rows safely so multiple publisher instances do not routinely publish the same row concurrently.
-3. The publisher sends a persistent message to a durable RabbitMQ exchange/queue and waits for publisher confirmation.
-4. Only after broker confirmation does it mark the outbox row as published.
-5. If the publisher crashes after RabbitMQ accepts a message but before the row is marked published, the message may be sent again. This is expected.
-6. The consumer records the event ID and its business effect in one database transaction. A unique constraint on the event ID makes repeated deliveries harmless.
-7. The consumer acknowledges the RabbitMQ message only after the database transaction commits.
-8. Transient failures are retried with a bounded policy. Messages that exhaust retries are routed to a dead-letter queue for inspection and controlled replay.
+2. A publisher claims pending rows safely so multiple publisher instances do not routinely publish the same row at the same time. A short PostgreSQL transaction uses `FOR UPDATE SKIP LOCKED` and assigns a time-limited lease; it commits before network I/O.
+3. The publisher sends a persistent message to a durable RabbitMQ exchange/queue, uses mandatory routing, and waits for publisher confirmation.
+4. Only after a positive broker confirmation does it mark the outbox row as published.
+5. On a send failure, the publisher releases its lease, records the error, and makes the row eligible for another attempt after a short delay. Phase 3.4 adds the bounded retry limit and dead-letter route.
+6. If the publisher crashes after RabbitMQ accepts a message but before the row is marked published, the lease eventually expires and the message may be sent again. This is expected.
+7. The consumer records the event ID and its business effect in one database transaction. A unique constraint on the event ID makes repeated deliveries harmless.
+8. The consumer acknowledges the RabbitMQ message only after the database transaction commits.
+9. Transient consumer failures are retried with a bounded policy. Messages that exhaust retries are routed to a dead-letter queue for inspection and controlled replay.
 
-The outbox publisher and consumer must be independently runnable processes. The API must remain usable if RabbitMQ is temporarily unavailable; events accumulate in PostgreSQL until publishing resumes.
+The outbox publisher and consumer are independently runnable processes. The API depends on PostgreSQL, not RabbitMQ; if the broker is temporarily unavailable, events accumulate in PostgreSQL until publishing resumes.
 
 ## Planned implementation increments
 
@@ -86,11 +87,13 @@ The outbox publisher and consumer must be independently runnable processes. The 
 - Do not require RabbitMQ yet.
 
 ### Phase 3.2 — RabbitMQ and publisher
-- Add RabbitMQ to Docker Compose with a health check and persistent broker configuration.
+- Add RabbitMQ to Docker Compose with a health check and persistent broker volume.
 - Add a separate outbox publisher process.
-- Publish persistent messages with publisher confirms.
-- Mark rows published only after confirmation; implement safe claiming/lease behavior.
-- Test broker outage and publisher restart behavior.
+- Declare a durable direct exchange and durable order queue.
+- Publish persistent messages with mandatory routing and publisher confirms.
+- Mark rows published only after confirmation; implement PostgreSQL `SKIP LOCKED` claiming and expiring leases.
+- Keep broker I/O outside database transactions.
+- Test positive/negative confirmations, concurrent claims, lease recovery after publisher crash, and real RabbitMQ delivery.
 
 ### Phase 3.3 — Idempotent worker
 - Add a separate worker process and durable queue topology.
@@ -115,15 +118,17 @@ The outbox publisher and consumer must be independently runnable processes. The 
 - A failed order never leaves an outbox event or partial stock reservation.
 - RabbitMQ downtime does not make order creation fail solely because the broker is unavailable.
 - The publisher never marks an event published before broker confirmation.
+- Concurrent publishers use leases so they do not routinely claim the same event.
+- Expired leases allow recovery after a publisher crash.
 - Duplicate deliveries do not duplicate the worker's business effect.
 - Messages are acknowledged only after successful consumer-side commit.
 - Retry attempts are bounded; exhausted messages are inspectable in a dead-letter queue.
-- CI tests the database behavior and the messaging integration without relying on external hosted services.
+- CI tests database behavior and messaging integration without relying on external hosted services.
 
 ## Engineering constraints
 
 - Keep the existing FastAPI API and PostgreSQL as the source of truth.
-- Keep broker I/O outside the order-creation transaction.
+- Keep broker I/O outside the order-creation transaction and outside outbox claim transactions.
 - Use explicit event schemas and schema versions; do not publish ORM objects.
 - Use UTC timestamps and stable event IDs.
 - Keep publisher and worker code separate from HTTP route handlers.
