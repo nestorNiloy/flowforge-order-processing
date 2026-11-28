@@ -1,4 +1,4 @@
-"""Consume OrderCreated events with transactional inbox deduplication."""
+"""Consume OrderCreated events with idempotency and bounded retry handling."""
 
 import json
 import logging
@@ -10,10 +10,20 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
-from app.messaging.topology import ORDERS_QUEUE_NAME, declare_topology
+from app.messaging.topology import (
+    DEAD_LETTER_EXCHANGE_NAME,
+    DEAD_LETTER_ROUTING_KEY,
+    ORDERS_QUEUE_NAME,
+    RETRY_EXCHANGE_NAME,
+    RETRY_ROUTING_KEY,
+    declare_topology,
+)
 from app.models.processed_message import OrderProcessingResult, ProcessedMessage
 
 logger = logging.getLogger("flowforge.worker")
+
+RETRY_COUNT_HEADER = "x-flowforge-retry-count"
+FAILURE_REASON_HEADER = "x-flowforge-failure-reason"
 
 
 class InvalidEventError(ValueError):
@@ -68,11 +78,7 @@ def process_order_created(
     event: dict,
     metadata: dict,
 ) -> bool:
-    """Persist inbox record and downstream result atomically.
-
-    PostgreSQL ON CONFLICT DO NOTHING makes the event ID the concurrency-safe
-    idempotency key. A duplicate returns False and creates no second result.
-    """
+    """Persist inbox record and downstream result atomically."""
     event_id, order, customer_reference, total_amount = _validate_event(event, metadata)
 
     with session_factory() as session:
@@ -112,11 +118,78 @@ def process_order_created(
     return True
 
 
-def handle_delivery(channel, method, properties, body, *, session_factory=SessionLocal) -> None:
-    """Ack only after the inbox and processing result transaction commits."""
+def _confirmed_publish(channel, *, exchange: str, routing_key: str, body: bytes, properties) -> None:
+    confirmed = channel.basic_publish(
+        exchange=exchange,
+        routing_key=routing_key,
+        body=body,
+        properties=properties,
+        mandatory=True,
+    )
+    if confirmed is False:
+        raise RuntimeError(f"RabbitMQ did not confirm route {exchange}:{routing_key}")
+
+
+def _retry_properties(properties, headers: dict, retry_count: int, delay_ms: int):
+    updated_headers = {
+        **headers,
+        RETRY_COUNT_HEADER: retry_count,
+    }
+    return pika.BasicProperties(
+        content_type=properties.content_type or "application/json",
+        content_encoding=properties.content_encoding,
+        delivery_mode=2,
+        headers=updated_headers,
+        priority=properties.priority,
+        correlation_id=properties.correlation_id,
+        reply_to=properties.reply_to,
+        expiration=str(delay_ms),
+        message_id=properties.message_id,
+        timestamp=properties.timestamp,
+        type=properties.type,
+        app_id=properties.app_id,
+    )
+
+
+def _dead_letter_properties(properties, headers: dict, retry_count: int, failure_reason: str):
+    updated_headers = {
+        **headers,
+        RETRY_COUNT_HEADER: retry_count,
+        FAILURE_REASON_HEADER: failure_reason[:500],
+    }
+    return pika.BasicProperties(
+        content_type=properties.content_type or "application/json",
+        content_encoding=properties.content_encoding,
+        delivery_mode=2,
+        headers=updated_headers,
+        priority=properties.priority,
+        correlation_id=properties.correlation_id,
+        reply_to=properties.reply_to,
+        message_id=properties.message_id,
+        timestamp=properties.timestamp,
+        type=properties.type,
+        app_id=properties.app_id,
+    )
+
+
+def handle_delivery(
+    channel,
+    method,
+    properties,
+    body,
+    *,
+    session_factory=SessionLocal,
+    max_retries: int | None = None,
+    retry_delay_ms: int | None = None,
+) -> None:
+    """Process, retry with delay, or dead-letter; ack only after confirmed handoff."""
+    settings = get_settings()
+    retry_limit = settings.worker_max_retries if max_retries is None else max_retries
+    delay_ms = settings.worker_retry_delay_ms if retry_delay_ms is None else retry_delay_ms
+    headers = dict(properties.headers or {})
+
     try:
         event = json.loads(body.decode("utf-8"))
-        headers = properties.headers or {}
         metadata = {
             "message_id": properties.message_id,
             "event_type": properties.type,
@@ -125,12 +198,67 @@ def handle_delivery(channel, method, properties, body, *, session_factory=Sessio
             "aggregate_id": headers.get("aggregate_id"),
         }
         process_order_created(session_factory, event, metadata)
-    except Exception:
-        logger.exception("Order event processing failed; requeueing delivery")
-        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-        return
+    except Exception as exc:
+        logger.exception("Order event processing failed")
 
-    # process_order_created has exited its transaction before this acknowledgement.
+        try:
+            raw_retry_count = headers.get(RETRY_COUNT_HEADER, 0)
+            try:
+                retry_count = int(raw_retry_count)
+                if retry_count < 0:
+                    raise ValueError("Retry count cannot be negative")
+            except (TypeError, ValueError):
+                # Malformed retry metadata is treated as exhausted, not reset to zero.
+                retry_count = retry_limit
+
+            failure_reason = f"{type(exc).__name__}: {exc}"[:500]
+            if retry_count < retry_limit:
+                next_retry_count = retry_count + 1
+                retry_properties = _retry_properties(
+                    properties,
+                    headers,
+                    next_retry_count,
+                    delay_ms,
+                )
+                _confirmed_publish(
+                    channel,
+                    exchange=RETRY_EXCHANGE_NAME,
+                    routing_key=RETRY_ROUTING_KEY,
+                    body=body,
+                    properties=retry_properties,
+                )
+                logger.warning(
+                    "Scheduled retry %s/%s for message_id=%s delay_ms=%s",
+                    next_retry_count,
+                    retry_limit,
+                    properties.message_id,
+                    delay_ms,
+                )
+            else:
+                dead_letter_properties = _dead_letter_properties(
+                    properties,
+                    headers,
+                    retry_count,
+                    failure_reason,
+                )
+                _confirmed_publish(
+                    channel,
+                    exchange=DEAD_LETTER_EXCHANGE_NAME,
+                    routing_key=DEAD_LETTER_ROUTING_KEY,
+                    body=body,
+                    properties=dead_letter_properties,
+                )
+                logger.error(
+                    "Moved message_id=%s to dead-letter queue after %s retries",
+                    properties.message_id,
+                    retry_count,
+                )
+        except Exception:
+            logger.exception("Could not hand off failed message; requeueing original delivery")
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            return
+
+    # Successful processing, retry handoff, or DLQ handoff is durable before ack.
     channel.basic_ack(delivery_tag=method.delivery_tag)
 
 
@@ -154,6 +282,7 @@ def run_forever() -> None:
             with pika.BlockingConnection(parameters) as connection:
                 channel = connection.channel()
                 declare_topology(channel)
+                channel.confirm_delivery()
                 channel.basic_qos(prefetch_count=1)
                 channel.basic_consume(
                     queue=ORDERS_QUEUE_NAME,
