@@ -77,6 +77,8 @@ services:
       DATABASE_URL: postgresql+psycopg://flowforge:flowforge_dev@db:5432/flowforge
       RABBITMQ_URL: amqp://flowforge:flowforge_dev@rabbitmq:5672/%2F
       WORKER_RECONNECT_SECONDS: 5
+      WORKER_MAX_RETRIES: 3
+      WORKER_RETRY_DELAY_MS: 5000
     depends_on:
       db:
         condition: service_healthy
