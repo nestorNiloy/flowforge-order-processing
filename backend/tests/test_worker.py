@@ -8,14 +8,31 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.db.session import Base
-from app.messaging.worker import handle_delivery, process_order_created
+from app.messaging.topology import (
+    DEAD_LETTER_EXCHANGE_NAME,
+    DEAD_LETTER_ROUTING_KEY,
+    RETRY_EXCHANGE_NAME,
+    RETRY_ROUTING_KEY,
+)
+from app.messaging.worker import (
+    FAILURE_REASON_HEADER,
+    RETRY_COUNT_HEADER,
+    handle_delivery,
+    process_order_created,
+)
 from app.models import Order, OrderProcessingResult, ProcessedMessage
 
 
 class FakeChannel:
-    def __init__(self):
+    def __init__(self, confirmation=True):
+        self.confirmation = confirmation
         self.acknowledged = []
         self.rejected = []
+        self.published = []
+
+    def basic_publish(self, **kwargs):
+        self.published.append(kwargs)
+        return self.confirmation
 
     def basic_ack(self, *, delivery_tag):
         self.acknowledged.append(delivery_tag)
@@ -93,7 +110,7 @@ def count_rows(session_factory, model) -> int:
 
 def test_worker_persists_inbox_and_result_once_for_duplicate_event(worker_session_factory):
     order_id = create_order(worker_session_factory)
-    event, properties, body = make_delivery(order_id)
+    event, properties, _ = make_delivery(order_id)
     metadata = {
         "message_id": properties.message_id,
         "event_type": properties.type,
@@ -135,6 +152,7 @@ def test_worker_acknowledges_after_successful_processing(worker_session_factory)
 
     assert channel.acknowledged == [41]
     assert channel.rejected == []
+    assert channel.published == []
     assert count_rows(worker_session_factory, ProcessedMessage) == 1
     assert count_rows(worker_session_factory, OrderProcessingResult) == 1
 
@@ -156,12 +174,12 @@ def test_duplicate_delivery_is_acknowledged_without_duplicate_effect(worker_sess
 
     assert channel.acknowledged == [51, 52]
     assert channel.rejected == []
+    assert channel.published == []
     assert count_rows(worker_session_factory, ProcessedMessage) == 1
     assert count_rows(worker_session_factory, OrderProcessingResult) == 1
 
 
-def test_failed_processing_rolls_back_inbox_and_requeues(worker_session_factory):
-    # The missing order causes the downstream result's foreign key to fail.
+def test_failed_processing_is_published_to_delayed_retry_queue(worker_session_factory):
     _, properties, body = make_delivery(999999)
     channel = FakeChannel()
     method = type("Method", (), {"delivery_tag": 61})()
@@ -172,15 +190,74 @@ def test_failed_processing_rolls_back_inbox_and_requeues(worker_session_factory)
         properties,
         body,
         session_factory=worker_session_factory,
+        max_retries=3,
+        retry_delay_ms=250,
     )
 
-    assert channel.acknowledged == []
-    assert channel.rejected == [(61, True)]
+    assert channel.acknowledged == [61]
+    assert channel.rejected == []
+    assert len(channel.published) == 1
+    retry = channel.published[0]
+    assert retry["exchange"] == RETRY_EXCHANGE_NAME
+    assert retry["routing_key"] == RETRY_ROUTING_KEY
+    assert retry["mandatory"] is True
+    assert retry["body"] == body
+    assert retry["properties"].delivery_mode == 2
+    assert retry["properties"].message_id == properties.message_id
+    assert retry["properties"].expiration == "250"
+    assert retry["properties"].headers[RETRY_COUNT_HEADER] == 1
     assert count_rows(worker_session_factory, ProcessedMessage) == 0
     assert count_rows(worker_session_factory, OrderProcessingResult) == 0
 
 
-def test_invalid_event_metadata_is_requeued(worker_session_factory):
+def test_exhausted_retries_are_published_to_dead_letter_queue(worker_session_factory):
+    _, properties, body = make_delivery(999999)
+    properties.headers[RETRY_COUNT_HEADER] = 3
+    channel = FakeChannel()
+    method = type("Method", (), {"delivery_tag": 62})()
+
+    handle_delivery(
+        channel,
+        method,
+        properties,
+        body,
+        session_factory=worker_session_factory,
+        max_retries=3,
+    )
+
+    assert channel.acknowledged == [62]
+    assert channel.rejected == []
+    assert len(channel.published) == 1
+    dead_letter = channel.published[0]
+    assert dead_letter["exchange"] == DEAD_LETTER_EXCHANGE_NAME
+    assert dead_letter["routing_key"] == DEAD_LETTER_ROUTING_KEY
+    assert dead_letter["mandatory"] is True
+    assert dead_letter["body"] == body
+    assert dead_letter["properties"].message_id == properties.message_id
+    assert dead_letter["properties"].headers[RETRY_COUNT_HEADER] == 3
+    assert "IntegrityError" in dead_letter["properties"].headers[FAILURE_REASON_HEADER]
+
+
+def test_failed_retry_handoff_requeues_original_delivery(worker_session_factory):
+    _, properties, body = make_delivery(999999)
+    channel = FakeChannel(confirmation=False)
+    method = type("Method", (), {"delivery_tag": 63})()
+
+    handle_delivery(
+        channel,
+        method,
+        properties,
+        body,
+        session_factory=worker_session_factory,
+        max_retries=3,
+    )
+
+    assert channel.acknowledged == []
+    assert channel.rejected == [(63, True)]
+    assert len(channel.published) == 1
+
+
+def test_invalid_event_metadata_is_sent_through_retry_policy(worker_session_factory):
     order_id = create_order(worker_session_factory)
     _, properties, body = make_delivery(order_id)
     properties.headers["schema_version"] = 99
@@ -193,9 +270,13 @@ def test_invalid_event_metadata_is_requeued(worker_session_factory):
         properties,
         body,
         session_factory=worker_session_factory,
+        max_retries=3,
     )
 
-    assert channel.acknowledged == []
-    assert channel.rejected == [(71, True)]
+    assert channel.acknowledged == [71]
+    assert channel.rejected == []
+    assert len(channel.published) == 1
+    assert channel.published[0]["exchange"] == RETRY_EXCHANGE_NAME
+    assert channel.published[0]["properties"].headers[RETRY_COUNT_HEADER] == 1
     assert count_rows(worker_session_factory, ProcessedMessage) == 0
     assert count_rows(worker_session_factory, OrderProcessingResult) == 0
