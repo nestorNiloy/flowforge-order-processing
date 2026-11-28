@@ -26,20 +26,30 @@ Client ───────────────> FastAPI
                            |
                            | leased rows, publisher confirms
                            v
-                       RabbitMQ
-                    durable exchange
+                 RabbitMQ: flowforge.events
                            |
-                    durable order queue
+                    flowforge.orders
                            |
                            v
                     independent worker
-                           |
-                           | one PostgreSQL transaction
-                           v
-                    PostgreSQL
-                    ├── processed_messages (inbox)
-                    └── order_processing_results
-~~~
+                      /          \
+             success/duplicate   processing failure
+                    |                 |
+                    v                 v
+             PostgreSQL       confirmed publish
+             inbox + result    to retry exchange
+                                     |
+                              retry queue (TTL)
+                                     |
+                             dead-letter back to
+                              primary exchange
+                                     |
+                               worker retries
+                                     |
+                          retry limit exhausted
+                                     |
+                             flowforge.orders.dlq
+~~~ 
 
 ## Event contract
 
@@ -70,19 +80,30 @@ The worker treats the RabbitMQ message ID as the idempotency key.
 
 The processing result is an observable simulation of a downstream order workflow. It does not initiate real fulfilment or shipping.
 
-## Delivery and failure semantics
+## Bounded retry and dead-letter flow
 
-The target guarantee is **at-least-once delivery with idempotent consumption**, not an unrealistic claim of end-to-end exactly-once delivery.
+The delivery guarantee remains **at-least-once with idempotent consumption**. A retry is a confirmed republish, not an unbounded broker requeue.
+
+1. The worker channel enables publisher confirms as well as manual consumer acknowledgements.
+2. If processing fails, the worker reads the `x-flowforge-retry-count` message header. A new message starts at zero.
+3. While the count is below `WORKER_MAX_RETRIES` (default `3`), the worker republishes the original body to the durable retry exchange with the count incremented and a per-message expiration (default `5000` ms).
+4. The durable retry queue holds the message until its expiration. Its dead-letter exchange and routing key return the message to the primary order exchange and queue.
+5. Once the retry count reaches the configured limit, the worker publishes the original body to the durable dead-letter exchange/queue. It adds `x-flowforge-failure-reason` and retains the event ID and retry count for diagnosis.
+6. The worker acknowledges the original delivery only after RabbitMQ confirms the retry or dead-letter publish. If the handoff cannot be confirmed, it negatively acknowledges the original with requeue enabled.
+7. The retry queue and dead-letter queue are durable. Messages are persistent, and mandatory routing prevents silently accepting an unroutable handoff.
+
+The retry limit counts retries after the first processing attempt. With the default limit of three, a message can be processed up to four times (the initial attempt plus three retries) before it is dead-lettered.
+
+A crash after the retry/DLQ publish is confirmed but before the original delivery is acknowledged can produce a duplicate handoff. This is part of at-least-once delivery; stable event IDs and idempotent processing keep successful business effects safe. Failed attempts roll back their inbox/result transaction before retrying.
+
+## Publisher and outbox failure semantics
 
 1. The outbox row is committed atomically with the order.
 2. A publisher claims pending rows safely so multiple publisher instances do not routinely publish the same row at the same time. A short PostgreSQL transaction uses `FOR UPDATE SKIP LOCKED` and assigns a time-limited lease; it commits before network I/O.
 3. The publisher sends a persistent message to a durable RabbitMQ exchange/queue, uses mandatory routing, and waits for publisher confirmation.
 4. Only after a positive broker confirmation does it mark the outbox row as published.
-5. On a send failure, the publisher releases its lease, records the error, and makes the row eligible for another attempt after a short delay. Phase 3.4 adds the bounded retry limit and dead-letter route.
+5. On a send failure, the publisher releases its lease, records the error, and makes the row eligible for another attempt after a short delay.
 6. If the publisher crashes after RabbitMQ accepts a message but before the row is marked published, the lease eventually expires and the message may be sent again. This is expected.
-7. The consumer records the event ID and its business effect in one database transaction. A unique constraint on the event ID makes repeated deliveries harmless.
-8. The consumer acknowledges the RabbitMQ message only after the database transaction commits.
-9. In Phase 3.3, a failed delivery is negatively acknowledged with requeue enabled. Phase 3.4 will add bounded retries and dead-letter routing to prevent an invalid or persistently failing message from being requeued indefinitely.
 
 The outbox publisher and consumer are independently runnable processes. The API depends on PostgreSQL, not RabbitMQ; if the broker is temporarily unavailable, events accumulate in PostgreSQL until publishing resumes.
 
@@ -92,6 +113,7 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Create a dedicated feature branch from the merged Phase 2 `main`.
 - Document the event contract, failure model, and acceptance criteria.
 - No application behavior changes.
+- **Status: complete.**
 
 ### Phase 3.1 — Outbox persistence
 - Add an outbox SQLAlchemy model and Alembic migration.
@@ -99,6 +121,7 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Insert the outbox row inside the existing `create_order` transaction.
 - Test that order, inventory reservation, and outbox row commit or roll back together.
 - Do not require RabbitMQ yet.
+- **Status: complete.**
 
 ### Phase 3.2 — RabbitMQ and publisher
 - Add RabbitMQ to Docker Compose with a health check and persistent broker volume.
@@ -116,12 +139,15 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Persist a downstream processing result in the same transaction as the inbox record.
 - Validate event metadata and acknowledge only after commit.
 - Test duplicate delivery, rollback, invalid events and acknowledgement behavior.
-- **Status: implementation added; local migration, test and container verification pending.**
+- **Status: implemented, locally verified end to end, 22 tests passing, and GitHub Actions CI passing.**
 
 ### Phase 3.4 — Retry and dead-letter handling
-- Add bounded retries and dead-letter routing.
-- Make failures observable and document safe replay.
-- Test transient failure, exhausted retry, and recovery scenarios.
+- Add durable retry and dead-letter exchanges/queues.
+- Add configurable bounded retries and delayed redelivery.
+- Confirm retry/DLQ handoff before acknowledging the original message.
+- Preserve event identity and attach retry count/failure reason metadata.
+- Test transient failure, exhausted retry, and failed handoff recovery.
+- **Status: implementation in progress; local and CI verification pending.**
 
 ### Phase 3.5 — End-to-end verification
 - Exercise API → PostgreSQL outbox → RabbitMQ → worker → PostgreSQL.
@@ -139,8 +165,9 @@ The outbox publisher and consumer are independently runnable processes. The API 
 - Expired leases allow recovery after a publisher crash.
 - Duplicate deliveries do not duplicate the worker's business effect.
 - Inbox record and downstream result commit or roll back atomically.
-- Messages are acknowledged only after successful consumer-side commit.
-- Retry attempts are bounded; exhausted messages are inspectable in a dead-letter queue.
+- Messages are acknowledged only after successful processing or a positively confirmed retry/DLQ handoff.
+- Retry attempts are bounded; exhausted messages are inspectable in a durable dead-letter queue.
+- A failed retry/DLQ handoff leaves the original message eligible for redelivery.
 - CI tests database behavior and messaging integration without relying on external hosted services.
 
 ## Engineering constraints
