@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     outbox_lease_seconds: int = 60
     publisher_reconnect_seconds: float = 5.0
     worker_reconnect_seconds: float = 5.0
+    worker_max_retries: int = 3
+    worker_retry_delay_ms: int = 5000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
